@@ -10,3 +10,7 @@ path = "src/lib.rs"
 [dependencies]
 defmt = "0.3"
 embedded-hal = { version = "1", features = ["defmt-03"] }
+
+[features]
+# Enable support for OSENSA FTX 101 OEM sensor
+osensa = []
