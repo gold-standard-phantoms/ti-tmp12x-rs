@@ -8,7 +8,6 @@ use embedded_hal::spi::{Operation, SpiDevice};
 ///
 /// This enum represents the LED current levels reported by the FTX 101
 /// through bits D1 and D0 of the temperature data packet.
-#[cfg(feature = "osensa")]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LedCurrentLevel {
     /// LED current under 500 (0b00)
@@ -27,13 +26,33 @@ pub enum LedCurrentLevel {
 ///
 /// This struct contains both the temperature measurement and the
 /// LED current level diagnostic information provided by the FTX 101.
-#[cfg(feature = "osensa")]
 #[derive(Debug, Clone, Copy)]
 pub struct OsensaReading {
     /// Temperature measurement in Celsius
     pub temperature: f64,
     /// LED current level indicator
     pub led_current: LedCurrentLevel,
+}
+
+/// Which sensor is behind the SPI bus. The two share a wire format, but the
+/// OSENSA FTX 101 uses the low bits for a validity flag (CFM) and LED current,
+/// and special values for "no probe" and "device error"; a TI TMP121/TMP123 has
+/// none of these, so decoding a TMP123 as an FTX 101 rejects every reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
+pub enum SensorKind {
+    /// TI TMP121 / TMP123.
+    Tmp12x,
+    /// OSENSA FTX 101 OEM fibre-optic transmitter.
+    OsensaFtx101,
+}
+
+impl SensorKind {
+    /// The kind `get_reading` assumes: OSENSA with the `osensa` feature, else TI.
+    pub const DEFAULT: SensorKind = if cfg!(feature = "osensa") {
+        SensorKind::OsensaFtx101
+    } else {
+        SensorKind::Tmp12x
+    };
 }
 
 pub struct Tmp12x<SPI> {
@@ -68,7 +87,6 @@ fn convert_words(words: &[u8; 2]) -> f64 {
     temperature as f64 * 0.0625
 }
 
-#[cfg(feature = "osensa")]
 fn convert_words_osensa<SPI: embedded_hal::spi::SpiDevice>(words: &[u8; 2]) -> Result<(f64, LedCurrentLevel), Error<SPI>> {
     // For FTX 101: Same temperature format as TMP123 but with additional bits:
     // D2: CFM (confirmation) bit - HIGH = valid, LOW = invalid
@@ -108,6 +126,14 @@ fn convert_words_osensa<SPI: embedded_hal::spi::SpiDevice>(words: &[u8; 2]) -> R
     Ok((temp_celsius, led_current))
 }
 
+/// Decodes a raw 2-byte reading for the given sensor kind.
+pub fn decode<SPI: SpiDevice>(words: &[u8; 2], kind: SensorKind) -> Result<f64, Error<SPI>> {
+    match kind {
+        SensorKind::Tmp12x => Ok(convert_words(words)),
+        SensorKind::OsensaFtx101 => convert_words_osensa::<SPI>(words).map(|(t, _)| t),
+    }
+}
+
 impl<SPI> Tmp12x<SPI>
 where
     SPI: SpiDevice,
@@ -139,61 +165,30 @@ where
     /// - `Error::NoProbe` - No probe detected (osensa only)
     /// - `Error::DeviceError` - Probe damaged or signal weak (osensa only)
     pub fn get_reading(&mut self) -> Result<f64, Error<SPI>> {
-        let mut words = [0u8; 2];
-        self.spi
-            .transaction(&mut [Operation::Read(&mut words)])
-            .map_err(Error::Spi)?;
-
-        #[cfg(feature = "osensa")]
-        {
-            // For FTX 101, validate the measurement using the CFM bit
-            let (temperature, _led_current) = convert_words_osensa::<SPI>(&words)?;
-            Ok(temperature)
-        }
-
-        #[cfg(not(feature = "osensa"))]
-        Ok(convert_words(&words))
+        self.get_reading_as(SensorKind::DEFAULT)
     }
 
-    /// Get a temperature reading with LED current diagnostics (OSENSA FTX 101 only).
+    /// Reads one temperature (°C), decoding it for the given sensor kind.
     ///
-    /// This method returns both the temperature measurement and LED current level
-    /// information provided by the FTX 101 sensor. The reading is validated using
-    /// the CFM (confirmation) bit.
-    ///
-    /// # Returns
-    /// - `Ok(OsensaReading)` - Valid temperature reading with diagnostics
-    /// - `Err(Error::InvalidMeasurement)` - CFM bit indicates invalid measurement
-    /// - `Err(Error::NoProbe)` - No probe detected (device returns 0x0000)
-    /// - `Err(Error::DeviceError)` - Device error (device returns 0x7FF8)
-    /// - `Err(Error::Spi)` - SPI communication error
-    ///
-    /// # Example
-    /// ```no_run
-    /// # use ti_tmp12x_rs::comms::{Tmp12x, OsensaReading, LedCurrentLevel};
-    /// # use embedded_hal::spi::SpiDevice;
-    /// # fn example<SPI: SpiDevice>(mut sensor: Tmp12x<SPI>) {
-    /// match sensor.get_osensa_reading() {
-    ///     Ok(reading) => {
-    ///         println!("Temperature: {}°C", reading.temperature);
-    ///         match reading.led_current {
-    ///             LedCurrentLevel::Under500 => println!("LED current < 500"),
-    ///             LedCurrentLevel::Range500To1000 => println!("LED current 500-1000"),
-    ///             LedCurrentLevel::Range1000To2000 => println!("LED current 1000-2000"),
-    ///             LedCurrentLevel::Over2000 => println!("LED current > 2000"),
-    ///             LedCurrentLevel::Unknown => println!("LED current unknown"),
-    ///         }
-    ///     },
-    ///     Err(e) => println!("Error: {:?}", e),
-    /// }
-    /// # }
-    /// ```
-    #[cfg(feature = "osensa")]
-    pub fn get_osensa_reading(&mut self) -> Result<OsensaReading, Error<SPI>> {
+    /// For [`SensorKind::OsensaFtx101`] this returns
+    /// [`Error::InvalidMeasurement`], [`Error::NoProbe`] or
+    /// [`Error::DeviceError`] as the FTX 101 reports them; for
+    /// [`SensorKind::Tmp12x`] only SPI errors are possible.
+    pub fn get_reading_as(&mut self, kind: SensorKind) -> Result<f64, Error<SPI>> {
+        let words = self.read_words()?;
+        decode(&words, kind)
+    }
+
+    fn read_words(&mut self) -> Result<[u8; 2], Error<SPI>> {
         let mut words = [0u8; 2];
         self.spi
             .transaction(&mut [Operation::Read(&mut words)])
             .map_err(Error::Spi)?;
+        Ok(words)
+    }
+
+    pub fn get_osensa_reading(&mut self) -> Result<OsensaReading, Error<SPI>> {
+        let words = self.read_words()?;
 
         let (temperature, led_current) = convert_words_osensa::<SPI>(&words)?;
         Ok(OsensaReading {
@@ -206,10 +201,7 @@ where
 
 #[cfg(test)]
 mod test {
-    use super::convert_words;
-    #[cfg(feature = "osensa")]
-    use super::{convert_words_osensa, LedCurrentLevel};
-    #[cfg(feature = "osensa")]
+    use super::{convert_words, convert_words_osensa, decode, LedCurrentLevel, SensorKind};
     use crate::error::Error;
 
     #[test]
@@ -226,7 +218,6 @@ mod test {
         assert_eq!(convert_words(&[0xE4, 0x80]), -55.0);
     }
 
-    #[cfg(feature = "osensa")]
     #[test]
     fn test_osensa_word_conversion() {
         // Create a dummy SPI type for testing
@@ -288,5 +279,32 @@ mod test {
         let result = convert_words_osensa::<DummySpi>(&[0xF3, 0x86]).unwrap();
         assert_eq!(result.0, -25.0);
         assert_eq!(result.1, LedCurrentLevel::Range1000To2000);
+    }
+
+    /// A TMP123 never sets the FTX 101's CFM bit (D2 reads 0), so the same
+    /// word is a valid TI reading and an invalid OSENSA one. This is why the
+    /// sensor kind has to be known at run time (bench, 2026-11-05).
+    #[test]
+    fn decode_depends_on_sensor_kind() {
+        use core::convert::Infallible;
+        struct DummySpi;
+        impl embedded_hal::spi::ErrorType for DummySpi {
+            type Error = Infallible;
+        }
+        impl embedded_hal::spi::SpiDevice for DummySpi {
+            fn transaction(&mut self, _operations: &mut [embedded_hal::spi::Operation<'_, u8>]) -> Result<(), Self::Error> {
+                Ok(())
+            }
+        }
+        // 19.8125 °C from a TMP123: 317 * 0.0625, i.e. 317 << 3 = 0x09E8, D2 = 0.
+        let words = [0x09, 0xE8];
+        assert_eq!(decode::<DummySpi>(&words, SensorKind::Tmp12x).unwrap(), 19.8125);
+        assert!(matches!(
+            decode::<DummySpi>(&words, SensorKind::OsensaFtx101),
+            Err(Error::InvalidMeasurement)
+        ));
+        // 0x0000 is 0 °C on a TMP123 but "no probe" on an FTX 101.
+        assert_eq!(decode::<DummySpi>(&[0, 0], SensorKind::Tmp12x).unwrap(), 0.0);
+        assert!(matches!(decode::<DummySpi>(&[0, 0], SensorKind::OsensaFtx101), Err(Error::NoProbe)));
     }
 }
